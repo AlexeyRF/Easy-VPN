@@ -172,7 +172,7 @@ def build_singbox_config(nodes):
         "outbounds": proxy_tags,
         "url": "http://cp.cloudflare.com/generate_204",
         "interval": "3m",
-        "tolerance": 50
+        "tolerance": 5000
     })
 
     config = {
@@ -219,6 +219,7 @@ class VpnWorker(QObject):
         self.sb_process = None
         self.is_running = False
         self.tester = None
+        self.working_nodes = []
 
     def start_vpn(self):
         if self.is_running:
@@ -238,11 +239,20 @@ class VpnWorker(QObject):
             self.status_changed.emit("VPN Выключен")
             return
             
-        working_nodes = result
-        self.status_changed.emit(f"Генерация конфига (сохранено {len(working_nodes[:200])} серверов)...")
+        self.working_nodes = result
+        self._start_singbox_with_nodes()
+
+    def _start_singbox_with_nodes(self):
+        if not self.working_nodes:
+            self.error_occurred.emit("Нет доступных серверов!")
+            self.is_running = False
+            self.status_changed.emit("VPN Выключен")
+            return
+            
+        self.status_changed.emit(f"Генерация конфига (сохранено {len(self.working_nodes[:200])} серверов)...")
         
         try:
-            config = build_singbox_config(working_nodes)
+            config = build_singbox_config(self.working_nodes)
             with open("config.json", "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2)
                 
@@ -272,9 +282,31 @@ class VpnWorker(QObject):
             self.is_running = False
             self.status_changed.emit("VPN Выключен")
 
+    def next_server(self):
+        if not self.is_running or not self.working_nodes:
+            return
+        
+        self.status_changed.emit("Переключение сервера...")
+        if self.sb_process:
+            self.sb_process.terminate()
+            try:
+                self.sb_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.sb_process.kill()
+            self.sb_process = None
+            
+        # Сдвигаем список (текущие лучшие серверы уходят в конец)
+        import random
+        # Берем первый элемент и переносим его в конец, или просто перемешиваем топ
+        top_node = self.working_nodes.pop(0)
+        self.working_nodes.append(top_node)
+        
+        # Перезапускаем sing-box
+        self._start_singbox_with_nodes()
+
     def stop_vpn(self):
         self.is_running = False
-        self.status_changed.emit("Остановка...")
+        self.status_changed.emit("Выключение...")
         
         if self.sb_process:
             self.sb_process.terminate()
@@ -341,7 +373,36 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.toggle_btn)
         main_layout.addLayout(btn_layout)
         
-        main_layout.addSpacing(40)
+        main_layout.addSpacing(20)
+        
+        # Switch Server Button
+        self.next_btn = QPushButton("Сменить сервер")
+        self.next_btn.setFixedSize(160, 40)
+        self.next_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self.next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.next_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #333333;
+                color: #ffffff;
+                border-radius: 20px;
+                border: 2px solid #444444;
+            }
+            QPushButton:hover {
+                background-color: #444444;
+            }
+            QPushButton:pressed {
+                background-color: #222222;
+            }
+        """)
+        self.next_btn.clicked.connect(self.next_server)
+        self.next_btn.hide() # Hidden when disconnected
+        
+        next_btn_layout = QHBoxLayout()
+        next_btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        next_btn_layout.addWidget(self.next_btn)
+        main_layout.addLayout(next_btn_layout)
+        
+        main_layout.addSpacing(20)
 
         # Status Label
         self.status_label = QLabel("Отключено")
@@ -425,20 +486,28 @@ class MainWindow(QMainWindow):
             self.worker.stop_vpn()
         else:
             self.worker.start_vpn()
+            
+    def next_server(self):
+        if self.worker.is_running:
+            self.worker.next_server()
 
     def update_status(self, text):
         if "VPN Включен" in text:
             self.status_label.setText("Подключено")
             self.status_label.setStyleSheet("color: #1abc9c; font-weight: bold;")
             self.set_btn_style_connected()
+            self.next_btn.show()
         elif "VPN Выключен" in text:
             self.status_label.setText("Отключено")
             self.status_label.setStyleSheet("color: #aaaaaa;")
             self.set_btn_style_disconnected()
+            self.next_btn.hide()
         else:
             self.status_label.setText(text)
             self.status_label.setStyleSheet("color: #e67e22;")
             self.set_btn_style_transitioning()
+            if "Переключение" not in text:
+                self.next_btn.hide()
 
     def show_error(self, text):
         self.error_label.setText(text)
